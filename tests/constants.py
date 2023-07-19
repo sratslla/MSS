@@ -35,11 +35,16 @@ except ImportError:
     SHA = ""
 else:
     repo = git.Repo(os.path.dirname(os.path.realpath(__file__)), search_parent_directories=True)
-    SHA = repo.head.object.hexsha[0:10]
+    try:
+        SHA = repo.head.object.hexsha[0:10]
+    except ValueError:
+        # mounted dir in docker container and owner is not root
+        SHA = ""
 
 CACHED_CONFIG_FILE = None
 SERVER_CONFIG_FILE = "mswms_settings.py"
 MSCOLAB_CONFIG_FILE = "mscolab_settings.py"
+MSCOLAB_AUTH_FILE = "mscolab_auth.py"
 ROOT_FS = TempFS(identifier=f"msui{SHA}")
 OSFS_URL = ROOT_FS.geturl("", purpose="fs")
 

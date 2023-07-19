@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 
-    mslib.utils.update_json_file_to_version_eight
+    mslib.utils.update_json_file_to_version_nine
     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     updates the old attributes to the new attributes and creates credentials in keyring
@@ -28,15 +28,12 @@
 
 import fs
 import json
-import logging
 import copy
 
-from keyring.errors import NoKeyringError, PasswordSetError, InitError
 from packaging import version
 from mslib import __version__
-from mslib.utils.auth import save_password_to_keyring
-from mslib.utils.migration.config_before_eight import read_config_file as read_config_file_before_eight
-from mslib.utils.migration.config_before_eight import config_loader as config_loader_before_eight
+from mslib.utils.migration.config_before_nine import read_config_file as read_config_file_before_nine
+from mslib.utils.migration.config_before_nine import config_loader as config_loader_before_nine
 from mslib.utils.config import modify_config_file
 from mslib.utils.config import read_config_file, config_loader
 from mslib.msui.constants import MSUI_SETTINGS
@@ -44,42 +41,26 @@ from mslib.msui.constants import MSUI_SETTINGS
 
 class JsonConversion:
     def __init__(self):
-        read_config_file_before_eight()
-        self.wms_login = config_loader_before_eight(dataset="WMS_login")
-        self.msc_login = config_loader_before_eight(dataset="MSC_login")
-        self.MSCOLAB_mailid = config_loader_before_eight(dataset="MSCOLAB_mailid")
-        self.MSCOLAB_password = config_loader_before_eight(dataset="MSCOLAB_password")
+        read_config_file_before_nine()
+        self.MSCOLAB_mailid = config_loader_before_nine(dataset="MSCOLAB_mailid")
+        self.MSS_auth = config_loader_before_nine(dataset="MSS_auth")
+        self.default_MSCOLAB = config_loader_before_nine(dataset="default_MSCOLAB")
 
     def change_parameters(self):
         """
         adds new parameters and store passwords in the keyring
         """
-        if version.parse(__version__) > version.parse('7.1.0') and version.parse(__version__) < version.parse('9.0.0'):
-            http_auth_login_data = {}
-            for url in self.wms_login.keys():
-                auth_username, auth_password = self.wms_login[url]
-                http_auth_login_data[url] = auth_username
-                try:
-                    save_password_to_keyring(url, auth_username, auth_password)
-                except (NoKeyringError, PasswordSetError, InitError) as ex:
-                    logging.warning("Can't use Keyring on your system to store credentials: %s" % ex)
+        if version.parse(__version__) > version.parse('8.0.0') and version.parse(__version__) < version.parse('10.0.0'):
 
-            for url in self.msc_login.keys():
-                auth_username, auth_password = self.msc_login[url]
-                http_auth_login_data[url] = auth_username
-                try:
-                    save_password_to_keyring(url, auth_username, auth_password)
-                except (NoKeyringError, PasswordSetError, InitError) as ex:
-                    logging.warning("Can't use Keyring on your system to store credentials: %s" % ex)
+            mss_auth = self.MSS_auth
+
+            for url, username in self.MSS_auth.items():
+                if url in self.default_MSCOLAB and mss_auth[url] != self.MSCOLAB_mailid:
+                    mss_auth[url] = self.MSCOLAB_mailid
 
             data_to_save_in_config_file = {
-                "MSS_auth": http_auth_login_data
+                "MSS_auth": mss_auth
             }
-            try:
-                save_password_to_keyring(service_name="MSCOLAB",
-                                         username=self.MSCOLAB_mailid, password=self.MSCOLAB_password)
-            except (NoKeyringError, PasswordSetError, InitError) as ex:
-                logging.warning("Can't use Keyring on your system to store credentials: %s" % ex)
 
             filename = MSUI_SETTINGS.replace('\\', '/')
             dir_name, file_name = fs.path.split(filename)
@@ -108,6 +89,6 @@ class JsonConversion:
 
 
 if __name__ == "__main__":
-    if version.parse(__version__) >= version.parse('8.0.0'):
+    if version.parse(__version__) >= version.parse('9.0.0'):
         new_version = JsonConversion()
         new_version.change_parameters()

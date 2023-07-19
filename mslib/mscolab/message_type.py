@@ -1,15 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 
-    mslib.version
-    ~~~~~~~~~~~~~~~~
-
-    This module provides the version number
+    mslib.mscolab.message_type.py
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
     This file is part of MSS.
 
-    :copyright: Copyright 2016-2017 Reimar Bauer
-    :copyright: Copyright 2016-2023 by the MSS team, see AUTHORS.
+    :copyright: Copyright 2019 Shivashis Padhi
+    :copyright: Copyright 2019-2023 by the MSS team, see AUTHORS.
     :license: APACHE-2.0, see LICENSE for details.
 
     Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,4 +22,11 @@
     See the License for the specific language governing permissions and
     limitations under the License.
 """
-__version__ = u'8.1.1'
+import enum
+
+
+class MessageType(enum.IntEnum):
+    TEXT = 0
+    SYSTEM_MESSAGE = 1
+    IMAGE = 2
+    DOCUMENT = 3

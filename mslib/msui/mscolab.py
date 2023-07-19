@@ -43,6 +43,7 @@ import urllib.request
 from fs import open_fs
 from PIL import Image
 from werkzeug.urls import url_join
+from keyring.errors import NoKeyringError, PasswordSetError, InitError
 
 from mslib.msui import flighttrack as ft
 from mslib.msui import mscolab_chat as mc
@@ -50,18 +51,70 @@ from mslib.msui import mscolab_admin_window as maw
 from mslib.msui import mscolab_version_history as mvh
 from mslib.msui import socket_control as sc
 
+import PyQt5
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from mslib.utils.auth import get_password_from_keyring, save_password_to_keyring, get_auth_from_url_and_name
+from mslib.utils.auth import get_password_from_keyring, save_password_to_keyring
 from mslib.utils.verify_user_token import verify_user_token
 from mslib.utils.qt import get_open_filename, get_save_filename, dropEvent, dragEnterEvent, show_popup
-from mslib.utils.qt import ui_mscolab_help_dialog as msc_help_dialog
-from mslib.utils.qt import ui_add_operation_dialog as add_operation_ui
-from mslib.utils.qt import ui_mscolab_merge_waypoints_dialog as merge_wp_ui
-from mslib.utils.qt import ui_mscolab_connect_dialog as ui_conn
-from mslib.utils.qt import ui_mscolab_profile_dialog as ui_profile
+from mslib.msui.qt5 import ui_mscolab_help_dialog as msc_help_dialog
+from mslib.msui.qt5 import ui_add_operation_dialog as add_operation_ui
+from mslib.msui.qt5 import ui_mscolab_merge_waypoints_dialog as merge_wp_ui
+from mslib.msui.qt5 import ui_mscolab_connect_dialog as ui_conn
+from mslib.msui.qt5 import ui_mscolab_profile_dialog as ui_profile
+from mslib.msui.qt5 import ui_operation_archive as ui_opar
 from mslib.msui import constants
-from mslib.utils.config import config_loader, load_settings_qsettings, save_settings_qsettings, modify_config_file
+from mslib.utils.config import config_loader, modify_config_file
+
+
+class MSColab_OperationArchiveBrowser(QtWidgets.QDialog, ui_opar.Ui_OperationArchiveBrowser):
+    def __init__(self, parent=None, mscolab=None):
+        super().__init__(parent)
+        self.setupUi(self)
+        self.parent = parent
+        self.mscolab = mscolab
+        self.pbClose.clicked.connect(self.hide)
+        self.pbUnarchiveOperation.setEnabled(False)
+        self.pbUnarchiveOperation.clicked.connect(self.unarchive_operation)
+        self.listArchivedOperations.itemClicked.connect(self.select_archived_operation)
+        self.setModal(True)
+
+    def select_archived_operation(self, item):
+        logging.debug('select_inactive_operation')
+        if item.access_level == "creator":
+            self.archived_op_id = item.op_id
+            self.pbUnarchiveOperation.setEnabled(True)
+        else:
+            self.archived_op_id = None
+            self.pbUnarchiveOperation.setEnabled(False)
+
+    def unarchive_operation(self):
+        logging.debug('unarchive_operation')
+        if verify_user_token(self.mscolab.mscolab_server_url, self.mscolab.token):
+            # set last used date for operation
+            data = {
+                "token": self.mscolab.token,
+                "op_id": self.archived_op_id,
+            }
+            url = url_join(self.mscolab.mscolab_server_url, 'set_last_used')
+            try:
+                res = requests.post(url, data=data, timeout=(2, 10))
+            except requests.exceptions.RequestException as e:
+                logging.debug(e)
+                show_popup(self.parent, "Error", "Some error occurred! Could not unarchive operation.")
+            else:
+                if res.text != "False":
+                    res = res.json()
+                    if res["success"]:
+                        self.mscolab.reload_operations()
+                    else:
+                        show_popup(self.parent, "Error", "Some error occurred! Could not activate operation")
+                else:
+                    show_popup(self.parent, "Error", "Session expired, new login required")
+                    self.mscolab.logout()
+        else:
+            show_popup(self.ui, "Error", "Your Connection is expired. New Login required!")
+            self.mscolab.logout()
 
 
 class MSColab_ConnectDialog(QtWidgets.QDialog, ui_conn.Ui_MSColabConnectDialog):
@@ -74,16 +127,17 @@ class MSColab_ConnectDialog(QtWidgets.QDialog, ui_conn.Ui_MSColabConnectDialog):
         Arguments:
         parent -- Qt widget that is parent to this widget.
         """
-        super(MSColab_ConnectDialog, self).__init__(parent)
+        super().__init__(parent)
         self.setupUi(self)
         self.parent = parent
         self.mscolab = mscolab
 
         # initialize server url as none
         self.mscolab_server_url = None
+        self.auth = None
 
         self.setFixedSize(self.size())
-        self.stackedWidget.setCurrentWidget(self.loginPage)
+        self.stackedWidget.setCurrentWidget(self.httpAuthPage)
 
         # disable widgets in login frame
         self.loginEmailLe.setEnabled(False)
@@ -93,6 +147,7 @@ class MSColab_ConnectDialog(QtWidgets.QDialog, ui_conn.Ui_MSColabConnectDialog):
 
         # add urls from settings to the combobox
         self.add_mscolab_urls()
+        self.mscolab_url_changed(self.urlCb.currentText())
 
         # connect login, adduser, connect buttons
         self.connectBtn.clicked.connect(self.connect_handler)
@@ -100,8 +155,10 @@ class MSColab_ConnectDialog(QtWidgets.QDialog, ui_conn.Ui_MSColabConnectDialog):
         self.addUserBtn.clicked.connect(lambda: self.stackedWidget.setCurrentWidget(self.newuserPage))
 
         # enable login button only if email and password are entered
-        self.loginEmailLe.textChanged[str].connect(self.enable_login_btn)
+        self.loginEmailLe.textChanged[str].connect(self.mscolab_login_changed)
         self.loginPasswordLe.textChanged[str].connect(self.enable_login_btn)
+
+        self.urlCb.editTextChanged.connect(self.mscolab_url_changed)
 
         # connect new user dialogbutton
         self.newUserBb.accepted.connect(self.new_user_handler)
@@ -110,23 +167,22 @@ class MSColab_ConnectDialog(QtWidgets.QDialog, ui_conn.Ui_MSColabConnectDialog):
         # connecting slot to clear all input widgets while switching tabs
         self.stackedWidget.currentChanged.connect(self.page_switched)
 
-        # fill value of mscolab url if found in QSettings storage
-        self.settings = load_settings_qsettings('mscolab', default_settings={'auth': {}, 'server_settings': {}})
+    def mscolab_url_changed(self, text):
+        self.httpPasswordLe.setText(
+            get_password_from_keyring("MSCOLAB_AUTH_" + text, "mscolab"))
+
+    def mscolab_login_changed(self, text):
+        self.loginPasswordLe.setText(
+            get_password_from_keyring(self.mscolab_server_url, text))
 
     def page_switched(self, index):
-        # clear all text in all input
-        self.loginEmailLe.setText("")
-        self.loginPasswordLe.setText("")
-
+        # clear all text in add user widget
         self.newUsernameLe.setText("")
         self.newEmailLe.setText("")
         self.newPasswordLe.setText("")
         self.newConfirmPasswordLe.setText("")
 
-        self.httpUsernameLe.setText("")
-        self.httpPasswordLe.setText("")
-
-        if index == 2:
+        if index == 1:
             self.connectBtn.setEnabled(False)
         else:
             self.connectBtn.setEnabled(True)
@@ -143,6 +199,7 @@ class MSColab_ConnectDialog(QtWidgets.QDialog, ui_conn.Ui_MSColabConnectDialog):
             self.statusLabel.setStyleSheet("")
             msg = "ⓘ  " + msg
         self.statusLabel.setText(msg)
+        logging.debug("set_status: %s", msg)
         QtWidgets.QApplication.processEvents()
 
     def add_mscolab_urls(self):
@@ -157,9 +214,16 @@ class MSColab_ConnectDialog(QtWidgets.QDialog, ui_conn.Ui_MSColabConnectDialog):
     def connect_handler(self):
         try:
             url = str(self.urlCb.currentText())
-            r = requests.get(url_join(url, 'status'))
-            if r.text == "Mscolab server":
-                self.set_status("Success", "Successfully connected to MSColab Server")
+            auth = "mscolab", self.httpPasswordLe.text()
+            s = requests.Session()
+            s.auth = auth
+            s.headers.update({'x-test': 'true'})
+            r = s.get(url_join(url, 'status'), timeout=(2, 10))
+            if r.status_code == 401:
+                self.set_status("Error", 'Server authentication data were incorrect.')
+            elif r.status_code == 200:
+                self.stackedWidget.setCurrentWidget(self.loginPage)
+                self.set_status("Success", "Successfully connected to MSColab server.")
                 # disable url input
                 self.urlCb.setEnabled(False)
 
@@ -170,40 +234,49 @@ class MSColab_ConnectDialog(QtWidgets.QDialog, ui_conn.Ui_MSColabConnectDialog):
                 self.loginPasswordLe.setEnabled(True)
 
                 self.mscolab_server_url = url
-                # delete mscolab http_auth settings for the url
-                if self.mscolab_server_url in self.settings["auth"].keys():
-                    del self.settings["auth"][self.mscolab_server_url]
+                self.auth = auth
+                save_password_to_keyring("MSCOLAB_AUTH_" + url, auth[0], auth[1])
 
-                if self.mscolab_server_url not in self.settings["server_settings"].keys():
-                    self.settings["server_settings"].update({self.mscolab_server_url: {}})
-                save_settings_qsettings('mscolab', self.settings)
+                url_list = config_loader(dataset="default_MSCOLAB")
+                if self.mscolab_server_url not in url_list:
+                    ret = PyQt5.QtWidgets.QMessageBox.question(
+                        self, self.tr("Update Server List"),
+                        self.tr("You are using a new MSColab server. "
+                                "Should your settings file be updated by adding the new server?"),
+                        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
+                    if ret == QtWidgets.QMessageBox.Yes:
+                        url_list = [self.mscolab_server_url] + url_list
+                        modify_config_file({"default_MSCOLAB": url_list})
 
                 # Fill Email and Password fields from config
-                self.loginEmailLe.setText(config_loader(dataset="MSCOLAB_mailid"))
-                self.loginPasswordLe.setText(get_password_from_keyring(service_name="MSCOLAB",
-                                             username=config_loader(dataset="MSCOLAB_mailid")))
-                self.enable_login_btn()
+                self.loginEmailLe.setText(
+                    config_loader(dataset="MSS_auth").get(self.mscolab_server_url))
+                self.mscolab_login_changed(self.loginEmailLe.text())
 
                 # Change connect button text and connect disconnect handler
                 self.connectBtn.setText('Disconnect')
-                self.connectBtn.clicked.disconnect(self.connect_handler)
+                try:
+                    self.connectBtn.clicked.disconnect(self.connect_handler)
+                except TypeError:
+                    pass
                 self.connectBtn.clicked.connect(self.disconnect_handler)
             else:
+                logging.error("Error %s", r)
                 self.set_status("Error", "Some unexpected error occurred. Please try again.")
         except requests.exceptions.SSLError:
             logging.debug("Certificate Verification Failed")
-            self.set_status("Error", "Certificate Verification Failed")
+            self.set_status("Error", "Certificate Verification Failed.")
         except requests.exceptions.InvalidSchema:
             logging.debug("invalid schema of url")
-            self.set_status("Error", "Invalid Url Scheme!")
+            self.set_status("Error", "Invalid Url Scheme.")
         except requests.exceptions.InvalidURL:
             logging.debug("invalid url")
-            self.set_status("Error", "Invalid URL")
+            self.set_status("Error", "Invalid URL.")
         except requests.exceptions.ConnectionError:
             logging.debug("MSColab server isn't active")
-            self.set_status("Error", "MSColab server isn't active")
+            self.set_status("Error", "MSColab server isn't active.")
         except Exception as e:
-            logging.debug("Error %s", str(e))
+            logging.error("Error %s %s", type(e), str(e))
             self.set_status("Error", "Some unexpected error occurred. Please try again.")
 
     def disconnect_handler(self):
@@ -216,111 +289,71 @@ class MSColab_ConnectDialog(QtWidgets.QDialog, ui_conn.Ui_MSColabConnectDialog):
         self.loginPasswordLe.setEnabled(False)
 
         # clear text
-        self.stackedWidget.setCurrentWidget(self.loginPage)
+        self.stackedWidget.setCurrentWidget(self.httpAuthPage)
 
-        # delete mscolab http_auth settings for the url
-        if self.mscolab_server_url in self.settings["auth"].keys():
-            del self.settings["auth"][self.mscolab_server_url]
-        save_settings_qsettings('mscolab', self.settings)
         self.mscolab_server_url = None
+        self.auth = None
 
         self.connectBtn.setText('Connect')
         self.connectBtn.clicked.disconnect(self.disconnect_handler)
         self.connectBtn.clicked.connect(self.connect_handler)
-        self.set_status("Info", 'Disconnected from server')
-
-    def authenticate(self, data, r, url):
-        if r.status_code == 401:
-            auth_username, auth_password = self.httpUsernameLe.text(), self.httpPasswordLe.text()
-            self.settings["auth"][self.mscolab_server_url] = (auth_username, auth_password)
-            s = requests.Session()
-            s.auth = (auth_username, auth_password)
-            s.headers.update({'x-test': 'true'})
-            r = s.post(url, data=data, timeout=(2, 10))
-        return r
+        self.set_status("Info", 'Disconnected from server.')
 
     def login_handler(self):
-        auth = get_auth_from_url_and_name(self.mscolab_server_url, config_loader(dataset="MSS_auth"))
-        emailid = self.loginEmailLe.text()
-        password = self.loginPasswordLe.text()
         data = {
-            "email": emailid,
-            "password": password
+            "email": self.loginEmailLe.text(),
+            "password": self.loginPasswordLe.text()
         }
         s = requests.Session()
-        s.auth = (auth[0], auth[1])
+        s.auth = self.auth
         s.headers.update({'x-test': 'true'})
         url = f'{self.mscolab_server_url}/token'
         url_recover_password = f'{self.mscolab_server_url}/reset_request'
         try:
             r = s.post(url, data=data, timeout=(2, 10))
+            if r.status_code == 401:
+                raise requests.exceptions.ConnectionError
         except requests.exceptions.ConnectionError as ex:
             logging.error("unexpected error: %s %s %s", type(ex), url, ex)
             self.set_status(
                 "Error",
-                "Failed to establish a new connection" f' to "{self.mscolab_server_url}". Try in a moment again.',
+                f'Failed to establish a new connection to "{self.mscolab_server_url}". Try again in a moment.',
             )
             self.disconnect_handler()
             return
 
         if r.text == "False":
             # show status indicating about wrong credentials
-            self.set_status("Error", 'Oh no, you need to add a user account or '
-                            f'<a href="{url_recover_password}">Recover Your Password</a>')
-        elif r.text == "Unauthorized Access":
-            # Server auth required for logging in
-            self.login_data = [data, r, url]
-            self.connectBtn.setEnabled(False)
-            self.stackedWidget.setCurrentWidget(self.httpAuthPage)
-            # ToDo disconnect functions already connected to httpBb buttonBox
-            self.httpBb.accepted.connect(self.login_server_auth)
-            self.httpBb.rejected.connect(lambda: self.stackedWidget.setCurrentWidget(self.loginPage))
+            self.set_status("Error", 'Invalid credentials. Fix them, create a new user, or '
+                            f'<a href="{url_recover_password}">recover your password</a>.')
         else:
-            save_password_to_keyring(service_name="MSCOLAB", username=emailid, password=password)
-            self.mscolab.after_login(emailid, self.mscolab_server_url, r)
+            self.save_user_credentials_to_config_file(data["email"], data["password"])
+            self.mscolab.after_login(data["email"], self.mscolab_server_url, r)
 
     def save_user_credentials_to_config_file(self, emailid, password):
-        data_to_save_in_config_file = {
-            "MSCOLAB_mailid": emailid
-        }
-
-        save_password_to_keyring(service_name="MSCOLAB", username=emailid, password=password)
-        exiting_mscolab_mailid = config_loader(dataset="MSCOLAB_mailid")
-        if exiting_mscolab_mailid != emailid:
+        try:
+            save_password_to_keyring(service_name=self.mscolab_server_url, username=emailid, password=password)
+        except (NoKeyringError, PasswordSetError, InitError) as ex:
+            logging.warning("Can't use Keyring on your system:  %s" % ex)
+        mss_auth = config_loader(dataset="MSS_auth")
+        if mss_auth.get(self.mscolab_server_url) != emailid:
             ret = QtWidgets.QMessageBox.question(
                 self, self.tr("Update Credentials"),
                 self.tr("You are using new credentials. "
                         "Should your settings file be updated with the new credentials?"),
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
             if ret == QtWidgets.QMessageBox.Yes:
-                modify_config_file(data_to_save_in_config_file)
-        else:
-            modify_config_file(data_to_save_in_config_file)
-
-    def login_server_auth(self):
-        data, r, url = self.login_data
-        emailid = data['email']
-        password = data['password']
-        if r.status_code == 401:
-            r = self.authenticate(data, r, url)
-            if r.status_code == 200 and r.text not in ["False", "Unauthorized Access"]:
-                self.save_auth_credentials_to_config_file()
-                self.save_user_credentials_to_config_file(emailid, password)
-                self.mscolab.after_login(emailid, self.mscolab_server_url, r)
-            else:
-                self.set_status("Error", 'Oh no, server authentication were incorrect.')
-                self.stackedWidget.setCurrentWidget(self.loginPage)
+                mss_auth[self.mscolab_server_url] = emailid
+                modify_config_file({"MSS_auth": mss_auth})
 
     def new_user_handler(self):
         # get mscolab /token http auth credentials from cache
-        auth = get_auth_from_url_and_name(self.mscolab_server_url, config_loader(dataset="MSS_auth"))
-
         emailid = self.newEmailLe.text()
         password = self.newPasswordLe.text()
         re_password = self.newConfirmPasswordLe.text()
         username = self.newUsernameLe.text()
         if password != re_password:
-            self.set_status("Error", 'Oh no, your passwords don\'t match')
+            self.set_status("Error", 'Your passwords don\'t match.')
             return
 
         data = {
@@ -329,7 +362,7 @@ class MSColab_ConnectDialog(QtWidgets.QDialog, ui_conn.Ui_MSColabConnectDialog):
             "username": username
         }
         s = requests.Session()
-        s.auth = (auth[0], auth[1])
+        s.auth = self.auth
         s.headers.update({'x-test': 'true'})
         url = f'{self.mscolab_server_url}/register'
         try:
@@ -338,13 +371,13 @@ class MSColab_ConnectDialog(QtWidgets.QDialog, ui_conn.Ui_MSColabConnectDialog):
             logging.error("unexpected error: %s %s %s", type(ex), url, ex)
             self.set_status(
                 "Error",
-                "Failed to establish a new connection" f' to "{self.mscolab_server_url}". Try in a moment again.',
+                f'Failed to establish a new connection to "{self.mscolab_server_url}". Try again in a moment.',
             )
             self.disconnect_handler()
             return
 
         if r.status_code == 204:
-            self.set_status("Success", 'You are registered, confirm your email to log in.')
+            self.set_status("Success", 'You are registered, confirm your email before logging in.')
             self.save_user_credentials_to_config_file(emailid, password)
             self.stackedWidget.setCurrentWidget(self.loginPage)
             self.loginEmailLe.setText(emailid)
@@ -355,12 +388,6 @@ class MSColab_ConnectDialog(QtWidgets.QDialog, ui_conn.Ui_MSColabConnectDialog):
             self.loginEmailLe.setText(emailid)
             self.loginPasswordLe.setText(password)
             self.login_handler()
-        elif r.status_code == 401:
-            self.newuser_data = [data, r, url]
-            self.stackedWidget.setCurrentWidget(self.httpAuthPage)
-            # ToDo disconnect functions already connected to httpBb buttonBox
-            self.httpBb.accepted.connect(self.newuser_server_auth)
-            self.httpBb.rejected.connect(lambda: self.stackedWidget.setCurrentWidget(self.newuserPage))
         else:
             try:
                 error_msg = json.loads(r.text)["message"]
@@ -368,48 +395,6 @@ class MSColab_ConnectDialog(QtWidgets.QDialog, ui_conn.Ui_MSColabConnectDialog):
                 logging.debug("Unexpected error occured %s", e)
                 error_msg = "Unexpected error occured. Please try again."
             self.set_status("Error", error_msg)
-
-    def save_auth_credentials_to_config_file(self):
-        http_auth_login_data = config_loader(dataset="MSS_auth")
-        auth_username = self.settings["auth"][self.mscolab_server_url][0]
-        auth_password = self.settings["auth"][self.mscolab_server_url][1]
-        http_auth_login_data[self.mscolab_server_url] = auth_username
-
-        data_to_save_in_config_file = {
-            "default_MSCOLAB": [self.mscolab_server_url],
-            "MSS_auth": http_auth_login_data
-        }
-
-        modify_config_file(data_to_save_in_config_file)
-        save_password_to_keyring(self.mscolab_server_url, auth_username, auth_password)
-
-    def newuser_server_auth(self):
-        data, r, url = self.newuser_data
-        r = self.authenticate(data, r, url)
-        if r.status_code == 201:
-            self.save_auth_credentials_to_config_file()
-            self.set_status("Success", "You are registered.")
-            self.save_user_credentials_to_config_file(data['email'], data['password'])
-            self.loginEmailLe.setText(data['email'])
-            self.loginPasswordLe.setText(data['password'])
-            self.login_handler()
-        elif r.status_code == 200:
-            try:
-                error_msg = json.loads(r.text)["message"]
-            except Exception as e:
-                logging.debug("Unexpected error occured %s", e)
-                error_msg = "Unexpected error occured. Please try again."
-            self.set_status("Error", error_msg)
-        elif r.status_code == 204:
-            self.save_auth_credentials_to_config_file()
-            self.set_status("Success", 'You are registered, confirm your email to log in.')
-            self.save_user_credentials_to_config_file(data['email'], data['password'])
-            self.stackedWidget.setCurrentWidget(self.loginPage)
-            self.loginEmailLe.setText(data['email'])
-            self.loginPasswordLe.setText(data['password'])
-        else:
-            self.set_status("Error", "Oh no, server authentication were incorrect.")
-            self.stackedWidget.setCurrentWidget(self.newuserPage)
 
 
 class MSUIMscolab(QtCore.QObject):
@@ -418,7 +403,7 @@ class MSUIMscolab(QtCore.QObject):
     """
     name = "Mscolab"
 
-    signal_activate_operation = QtCore.Signal(int, name="signal_activate_operation")
+    signal_unarchive_operation = QtCore.Signal(int, name="signal_unarchive_operation")
     signal_operation_added = QtCore.Signal(int, str, name="signal_operation_added")
     signal_operation_removed = QtCore.Signal(int, name="signal_operation_removed")
     signal_login_mscolab = QtCore.Signal(str, str, name="signal_login_mscolab")
@@ -428,18 +413,23 @@ class MSUIMscolab(QtCore.QObject):
     signal_render_new_permission = QtCore.Signal(int, str)
 
     def __init__(self, parent=None, data_dir=None):
-        super(MSUIMscolab, self).__init__(parent)
+        super().__init__(parent)
         self.ui = parent
+
+        self.operation_archive_browser = MSColab_OperationArchiveBrowser(self.ui, self)
+        self.operation_archive_browser.hide()
+        self.ui.listInactiveOperationsMSC = self.operation_archive_browser.listArchivedOperations
 
         # connect mscolab help action from help menu
         self.ui.actionMSColabHelp.triggered.connect(self.open_help_dialog)
+        self.ui.pbOpenOperationArchive.clicked.connect(self.open_operation_archive)
 
         # hide mscolab related widgets
         self.ui.usernameLabel.hide()
         self.ui.userOptionsTb.hide()
         self.ui.actionAddOperation.setEnabled(False)
-        self.hide_operation_options()
         self.ui.activeOperationDesc.setHidden(True)
+        self.hide_operation_options()
 
         # reset operation description label for flight tracks and open views
         self.ui.listFlightTracks.itemDoubleClicked.connect(self.listFlighttrack_itemDoubleClicked)
@@ -453,13 +443,15 @@ class MSUIMscolab(QtCore.QObject):
         self.ui.actionManageUsers.triggered.connect(self.operation_options_handler)
         self.ui.actionDeleteOperation.triggered.connect(self.operation_options_handler)
         self.ui.actionLeaveOperation.triggered.connect(self.operation_options_handler)
-        self.ui.actionUpdateOperationDesc.triggered.connect(self.update_description_handler)
+        self.ui.actionChangeCategory.triggered.connect(self.change_category_handler)
+        self.ui.actionChangeDescription.triggered.connect(self.change_description_handler)
         self.ui.actionRenameOperation.triggered.connect(self.rename_operation_handler)
-        self.ui.actionActivateOperation.triggered.connect(self.activate_operation)
-        self.ui.actionDescription.triggered.connect(
-            lambda: QtWidgets.QMessageBox.information(None,
-                                                      "Operation Description",
-                                                      f"{self.active_operation_desc}"))
+        self.ui.actionArchiveOperation.triggered.connect(self.archive_operation)
+        self.ui.actionViewDescription.triggered.connect(
+            lambda: QtWidgets.QMessageBox.information(
+                None, "Operation Description",
+                f"Category: {self.active_operation_category}\n"
+                f"{self.active_operation_description}"))
 
         self.ui.filterCategoryCb.currentIndexChanged.connect(self.operation_category_handler)
         # connect slot for handling operation options combobox
@@ -478,14 +470,16 @@ class MSUIMscolab(QtCore.QObject):
 
         # if token is None, not authorized, else authorized
         self.token = None
+        # int to store new pid
+        self.new_op_id = None
         # int to store active pid
         self.active_op_id = None
-        # int to store selected inactive op_id
-        self.inactive_op_id = None
         # storing access_level to save network call
         self.access_level = None
         # storing operation_name to save network call
         self.active_operation_name = None
+        # storing operation category to save network call
+        self.active_operation_category = None
         # Storing operation list to pass to admin window
         self.operations = None
         # store active_flight_path here as object
@@ -493,7 +487,7 @@ class MSUIMscolab(QtCore.QObject):
         # Store active operation's file path
         self.local_ftml_file = None
         # Store active_operation_description
-        self.active_operation_desc = None
+        self.active_operation_description = None
         # connection object to interact with sockets
         self.conn = None
         # operation window
@@ -523,6 +517,9 @@ class MSUIMscolab(QtCore.QObject):
         else:
             self.data_dir = data_dir
         self.create_dir()
+
+    def open_operation_archive(self):
+        self.operation_archive_browser.show()
 
     def create_dir(self):
         # ToDo this needs to be done earlier
@@ -561,13 +558,13 @@ class MSUIMscolab(QtCore.QObject):
         self.connect_window.exec_()
 
     def after_login(self, emailid, url, r):
+        logging.debug("after login %s %s", emailid, url)
         # emailid by direct call
         self.email = emailid
         self.connect_window.close()
         self.connect_window = None
         QtWidgets.QApplication.processEvents()
         # fill value of mscolab url if found in QSettings storage
-        self.settings = load_settings_qsettings('mscolab', default_settings={'auth': {}, 'server_settings': {}})
 
         _json = json.loads(r.text)
         self.token = _json["token"]
@@ -579,7 +576,7 @@ class MSUIMscolab(QtCore.QObject):
             self.conn = sc.ConnectionManager(self.token, user=self.user, mscolab_server_url=self.mscolab_server_url)
         except Exception as ex:
             logging.debug("Couldn't create a socket connection: %s", ex)
-            show_popup(self.ui, "Error", "Couldn't create a socket connection. Maybe the mscolab server is too old."
+            show_popup(self.ui, "Error", "Couldn't create a socket connection. Maybe the MSColab server is too old. "
                                          "New Login required!")
             self.logout()
         else:
@@ -613,16 +610,12 @@ class MSUIMscolab(QtCore.QObject):
             # Show category list
             self.show_categories_to_ui()
 
-            # show operation_description
             self.ui.activeOperationDesc.setHidden(False)
-            # disable update operation description button
-            self.ui.actionUpdateOperationDesc.setEnabled(False)
-            # disable delete operation button
+            self.ui.actionChangeCategory.setEnabled(False)
+            self.ui.actionChangeDescription.setEnabled(False)
             self.ui.actionDeleteOperation.setEnabled(False)
-            # disable category change selector
             self.ui.filterCategoryCb.setEnabled(True)
-            # disable activate operation button
-            self.ui.actionActivateOperation.setEnabled(False)
+            self.ui.actionViewDescription.setEnabled(False)
 
             self.signal_login_mscolab.emit(self.mscolab_server_url, self.token)
 
@@ -816,6 +809,7 @@ class MSUIMscolab(QtCore.QObject):
             self.logout()
 
     def add_operation(self):
+        logging.debug("add_operation")
         path = self.add_proj_dialog.path.text()
         description = self.add_proj_dialog.description.toPlainText()
         category = self.add_proj_dialog.category.text()
@@ -851,6 +845,7 @@ class MSUIMscolab(QtCore.QObject):
             self.error_dialog = QtWidgets.QErrorMessage()
             self.error_dialog.showMessage('Your operation was created successfully')
             op_id = self.get_recent_op_id()
+            self.new_op_id = op_id
             self.conn.handle_new_operation(op_id)
             self.signal_operation_added.emit(op_id, path)
         else:
@@ -872,6 +867,7 @@ class MSUIMscolab(QtCore.QObject):
                 op_id = None
                 if operations:
                     op_id = operations[-1]["op_id"]
+                logging.debug("recent op_id %s", op_id)
                 return op_id
             else:
                 show_popup(self.ui, "Error", "Session expired, new login required")
@@ -930,12 +926,14 @@ class MSUIMscolab(QtCore.QObject):
                 self.admin_window.activateWindow()
                 return
 
+            operations = [operation for operation in self.operations if operation["active"] is True]
+
             self.admin_window = maw.MSColabAdminWindow(
                 self.token,
                 self.active_op_id,
                 self.user,
                 self.active_operation_name,
-                self.operations,
+                operations,
                 self.conn,
                 mscolab_server_url=self.mscolab_server_url,
             )
@@ -999,6 +997,7 @@ class MSUIMscolab(QtCore.QObject):
             self.version_window = None
 
     def handle_delete_operation(self):
+        logging.debug("handle_delete_operation")
         if verify_user_token(self.mscolab_server_url, self.token):
             entered_operation_name, ok = QtWidgets.QInputDialog.getText(
                 self.ui,
@@ -1024,6 +1023,9 @@ class MSUIMscolab(QtCore.QObject):
                         res.raise_for_status()
                         self.reload_operations()
                         self.signal_operation_removed.emit(self.active_op_id)
+                        logging.debug("activate local")
+                        self.ui.listFlightTracks.setCurrentRow(0)
+                        self.ui.activate_selected_flight_track()
                 else:
                     show_popup(self.ui, "Error", "Entered operation name did not match!")
         else:
@@ -1031,6 +1033,7 @@ class MSUIMscolab(QtCore.QObject):
             self.logout()
 
     def handle_leave_operation(self):
+        logging.debug("handle_leave_operation")
         w = QtWidgets.QWidget()
         qm = QtWidgets.QMessageBox
         reply = qm.question(w, self.tr('Mission Support System'),
@@ -1061,27 +1064,57 @@ class MSUIMscolab(QtCore.QObject):
                 self.logout()
 
     def set_operation_desc_label(self, op_desc):
-        self.active_operation_desc = op_desc
-        desc_count = len(str(self.active_operation_desc))
+        self.active_operation_description = op_desc
+        desc_count = len(str(self.active_operation_description))
         if desc_count < 95:
             self.ui.activeOperationDesc.setText(
-                self.ui.tr(f"{self.active_operation_name}: {self.active_operation_desc}"))
+                self.ui.tr(f"{self.active_operation_name}: {self.active_operation_description}"))
         else:
             self.ui.activeOperationDesc.setText(
                 "Description is too long to show here, for long descriptions go "
                 "to operations menu.")
 
-    def update_description_handler(self):
+    def change_category_handler(self):
+        # only after login
+        if verify_user_token(self.mscolab_server_url, self.token):
+            entered_operation_category, ok = QtWidgets.QInputDialog.getText(
+                self.ui,
+                self.ui.tr(f"{self.active_operation_name} - Change Category"),
+                self.ui.tr(
+                    "You're about to change the operation category\n"
+                    "Enter new operation category: "
+                ),
+                text=self.active_operation_category
+            )
+            if ok:
+                data = {
+                    "token": self.token,
+                    "op_id": self.active_op_id,
+                    "attribute": 'category',
+                    "value": entered_operation_category
+                }
+                url = url_join(self.mscolab_server_url, 'update_operation')
+                r = requests.post(url, data=data, timeout=(2, 10))
+                if r.text == "True":
+                    self.active_operation_category = entered_operation_category
+                    self.reload_operation_list()
+                    self.error_dialog = QtWidgets.QErrorMessage()
+                    self.error_dialog.showMessage("Description is updated successfully.")
+        else:
+            show_popup(self.ui, "Error", "Your Connection is expired. New Login required!")
+            self.logout()
+
+    def change_description_handler(self):
         # only after login
         if verify_user_token(self.mscolab_server_url, self.token):
             entered_operation_desc, ok = QtWidgets.QInputDialog.getText(
                 self.ui,
-                self.ui.tr(f"{self.active_operation_name} - Update Description"),
+                self.ui.tr(f"{self.active_operation_name} - Change Description"),
                 self.ui.tr(
-                    "You're about to update the operation description"
-                    "\nEnter new operation description: "
+                    "You're about to change the operation description\n"
+                    "Enter new operation description: "
                 ),
-                text=self.active_operation_desc
+                text=self.active_operation_description
             )
             if ok:
                 data = {
@@ -1128,7 +1161,7 @@ class MSUIMscolab(QtCore.QObject):
                     self.active_operation_name = entered_operation_name
 
                     # Update active operation description
-                    self.set_operation_desc_label(self.active_operation_desc)
+                    self.set_operation_desc_label(self.active_operation_description)
                     self.reload_operation_list()
                     self.reload_windows_slot()
                     # Update other user's operation list
@@ -1318,7 +1351,7 @@ class MSUIMscolab(QtCore.QObject):
                 widgetItem.catgegory = operation["category"]
                 widgetItem.operation_path = operation["path"]
                 widgetItem.access_level = operation["access_level"]
-                widgetItem.active_operation_desc = operation["description"]
+                widgetItem.active_operation_description = operation["description"]
                 self.ui.listOperationsMSC.addItem(widgetItem)
                 self.signal_render_new_permission.emit(operation["op_id"], operation["path"])
             if self.chat_window is not None:
@@ -1405,9 +1438,17 @@ class MSUIMscolab(QtCore.QObject):
                 show_popup(self.ui, "Permission Revoked", "Access to an operation was revoked")
                 self.signal_permission_revoked.emit(op_id)
 
+            if self.active_op_id == op_id:
+                self.ui.listFlightTracks.setCurrentRow(0)
+                self.ui.activate_selected_flight_track()
+
     @QtCore.Slot(int)
     def handle_operation_deleted(self, op_id):
+        old_operation_name = self.active_operation_name
+        old_active_id = self.active_op_id
         operation_name = self.delete_operation_from_list(op_id)
+        if op_id == old_active_id and operation_name is None:
+            operation_name = old_operation_name
         show_popup(self.ui, "Success", f'Operation "{operation_name}" was deleted!', icon=1)
 
     def show_categories_to_ui(self):
@@ -1435,6 +1476,7 @@ class MSUIMscolab(QtCore.QObject):
                     self.ui.filterCategoryCb.setCurrentIndex(index)
 
     def add_operations_to_ui(self):
+        logging.debug('add_operations_to_ui')
         if verify_user_token(self.mscolab_server_url, self.token):
             data = {
                 "token": self.token
@@ -1446,12 +1488,13 @@ class MSUIMscolab(QtCore.QObject):
                 logging.debug("adding operations to ui")
                 operations = sorted(self.operations, key=lambda k: k["path"].lower())
                 self.ui.listOperationsMSC.clear()
-                self.ui.listInactiveOperationsMSC.clear()
-                selectedOperation = None
+                self.operation_archive_browser.listArchivedOperations.clear()
+                new_operation = None
+                active_operation = None
                 for operation in operations:
                     operation_desc = f'{operation["path"]} - {operation["access_level"]}'
                     widgetItem = QtWidgets.QListWidgetItem(operation_desc)
-                    widgetItem.active_operation_desc = operation["description"]
+                    widgetItem.active_operation_description = operation["description"]
                     widgetItem.op_id = operation["op_id"]
                     widgetItem.access_level = operation["access_level"]
                     widgetItem.operation_path = operation["path"]
@@ -1462,17 +1505,22 @@ class MSUIMscolab(QtCore.QObject):
                         widgetItem.active = operation["active"]
                     except KeyError:
                         widgetItem.active = True
-                    if widgetItem.op_id == self.active_op_id:
-                        selectedOperation = widgetItem
                     if widgetItem.active:
                         self.ui.listOperationsMSC.addItem(widgetItem)
+                        if widgetItem.op_id == self.active_op_id:
+                            active_operation = widgetItem
+                        if widgetItem.op_id == self.new_op_id:
+                            new_operation = widgetItem
                     else:
-                        self.ui.listInactiveOperationsMSC.addItem(widgetItem)
-                if selectedOperation is not None:
-                    self.ui.listOperationsMSC.setCurrentItem(selectedOperation)
-                    self.ui.listOperationsMSC.itemActivated.emit(selectedOperation)
+                        self.operation_archive_browser.listArchivedOperations.addItem(widgetItem)
+                if new_operation is not None:
+                    logging.debug("%s %s %s", new_operation, self.new_op_id, self.active_op_id)
+                    self.ui.listOperationsMSC.itemActivated.emit(new_operation)
+                elif active_operation is not None:
+                    logging.debug("%s %s %s", new_operation, self.new_op_id, self.active_op_id)
+                    self.ui.listOperationsMSC.itemActivated.emit(active_operation)
                 self.ui.listOperationsMSC.itemActivated.connect(self.set_active_op_id)
-                self.ui.listInactiveOperationsMSC.itemActivated.connect(self.select_inactive_operation)
+                self.new_op_id = None
             else:
                 show_popup(self.ui, "Error", "Session expired, new login required")
                 self.logout()
@@ -1480,54 +1528,48 @@ class MSUIMscolab(QtCore.QObject):
             show_popup(self.ui, "Error", "Your Connection is expired. New Login required!")
             self.logout()
 
-    def select_inactive_operation(self, item):
-        self.inactive_op_id = item.op_id
-        self.active_op_id = None
-        font = QtGui.QFont()
-        for i in range(self.ui.listInactiveOperationsMSC.count()):
-            self.ui.listInactiveOperationsMSC.item(i).setFont(font)
-        font.setBold(True)
-        item.setFont(font)
-        self.show_operation_options_in_inactivated_state(item.access_level)
-
     def show_operation_options_in_inactivated_state(self, access_level):
-        self.ui.actionChat.setEnabled(False)
-        self.ui.actionVersionHistory.setEnabled(False)
-        self.ui.actionManageUsers.setEnabled(False)
-        self.ui.menuProperties.setEnabled(False)
-        self.ui.actionRenameOperation.setEnabled(False)
-        self.ui.actionLeaveOperation.setEnabled(False)
-        self.ui.actionDeleteOperation.setEnabled(False)
-        self.ui.actionUpdateOperationDesc.setEnabled(False)
-        self.ui.actionActivateOperation.setEnabled(False)
-        if access_level == "creator":
-            self.ui.actionActivateOperation.setEnabled(True)
+        pass
 
-    def activate_operation(self):
+    def archive_operation(self):
+        logging.debug("handle_archive_operation")
         if verify_user_token(self.mscolab_server_url, self.token):
-            # set last used date for operation
-            data = {
-                "token": self.token,
-                "op_id": self.inactive_op_id,
-            }
-            res = requests.post(f'{self.mscolab_server_url}/set_last_used', data=data, timeout=(2, 10))
-            if res.text != "False":
-                res = res.json()
-                if res["success"]:
-                    self.reload_operations()
+            ret = QtWidgets.QMessageBox.warning(
+                self.ui, self.tr("Mission Support System"),
+                self.tr(f"Do you want to archive this operation '{self.active_operation_name}'?"),
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No)
+            if ret == QtWidgets.QMessageBox.Yes:
+                data = {
+                    "token": self.token,
+                    "op_id": self.active_op_id,
+                    "days": 31,
+                }
+                url = url_join(self.mscolab_server_url, 'set_last_used')
+                try:
+                    res = requests.post(url, data=data, timeout=(2, 10))
+                except requests.exceptions.RequestException as e:
+                    logging.debug(e)
+                    show_popup(self.ui, "Error", "Some error occurred! Could not archive operation.")
                 else:
-                    show_popup(self.ui, "Error", "Some error occurred! Could not activate operation")
-            else:
-                show_popup(self.ui, "Error", "Session expired, new login required")
-                self.logout()
+                    res.raise_for_status()
+                    self.reload_operations()
+                    self.signal_operation_removed.emit(self.active_op_id)
+                    logging.debug("activate local")
+                    self.ui.listFlightTracks.setCurrentRow(0)
+                    self.ui.activate_selected_flight_track()
         else:
             show_popup(self.ui, "Error", "Your Connection is expired. New Login required!")
             self.logout()
 
     def set_active_op_id(self, item):
+        logging.debug('set_active_op_id %s %s %s', item, item.op_id, self.active_op_id)
         if verify_user_token(self.mscolab_server_url, self.token):
             if not self.ui.local_active:
                 if item.op_id == self.active_op_id:
+                    font = QtGui.QFont()
+                    font.setBold(True)
+                    item.setFont(font)
                     return
 
             # close all hanging window
@@ -1540,7 +1582,7 @@ class MSUIMscolab(QtCore.QObject):
             self.ui.workLocallyCheckbox.blockSignals(False)
 
             # Disable Activate Operation Button
-            self.ui.actionActivateOperation.setEnabled(False)
+            # self.ui.actionUnarchiveOperation.setEnabled(False)
 
             # set last used date for operation
             data = {
@@ -1553,10 +1595,11 @@ class MSUIMscolab(QtCore.QObject):
             self.active_op_id = item.op_id
             self.access_level = item.access_level
             self.active_operation_name = item.operation_path
-            self.active_operation_desc = item.active_operation_desc
+            self.active_operation_description = item.active_operation_description
+            self.active_operation_category = item.operation_category
             self.waypoints_model = None
 
-            self.signal_activate_operation.emit(self.active_op_id)
+            self.signal_unarchive_operation.emit(self.active_op_id)
 
             self.inactive_op_id = None
             font = QtGui.QFont()
@@ -1565,7 +1608,7 @@ class MSUIMscolab(QtCore.QObject):
             font.setBold(False)
 
             # Set active operation description
-            self.set_operation_desc_label(self.active_operation_desc)
+            self.set_operation_desc_label(self.active_operation_description)
             # set active flightpath here
             self.load_wps_from_server()
             # display working status
@@ -1600,6 +1643,7 @@ class MSUIMscolab(QtCore.QObject):
                 self.logout()
 
     def switch_to_local(self):
+        logging.debug('switch_to_local')
         self.ui.local_active = True
         if self.active_op_id is not None:
             if verify_user_token(self.mscolab_server_url, self.token):
@@ -1621,11 +1665,15 @@ class MSUIMscolab(QtCore.QObject):
         self.ui.actionChat.setEnabled(False)
         self.ui.actionVersionHistory.setEnabled(False)
         self.ui.actionManageUsers.setEnabled(False)
-        self.ui.menuProperties.setEnabled(True)
         self.ui.actionRenameOperation.setEnabled(False)
         self.ui.actionLeaveOperation.setEnabled(True)
         self.ui.actionDeleteOperation.setEnabled(False)
-        self.ui.actionUpdateOperationDesc.setEnabled(False)
+        self.ui.actionChangeCategory.setEnabled(False)
+        self.ui.actionChangeDescription.setEnabled(False)
+        self.ui.actionArchiveOperation.setEnabled(False)
+        self.ui.actionViewDescription.setEnabled(True)
+        self.ui.menuProperties.setEnabled(True)
+
         if self.access_level == "viewer":
             self.ui.menuImportFlightTrack.setEnabled(False)
             return
@@ -1647,7 +1695,8 @@ class MSUIMscolab(QtCore.QObject):
 
         if self.access_level in ["creator", "admin"]:
             self.ui.actionManageUsers.setEnabled(True)
-            self.ui.actionUpdateOperationDesc.setEnabled(True)
+            self.ui.actionChangeCategory.setEnabled(True)
+            self.ui.actionChangeDescription.setEnabled(True)
             self.ui.filterCategoryCb.setEnabled(True)
         else:
             if self.admin_window is not None:
@@ -1657,6 +1706,7 @@ class MSUIMscolab(QtCore.QObject):
             self.ui.actionDeleteOperation.setEnabled(True)
             self.ui.actionRenameOperation.setEnabled(True)
             self.ui.actionLeaveOperation.setEnabled(False)
+            self.ui.actionArchiveOperation.setEnabled(True)
 
         self.ui.menuImportFlightTrack.setEnabled(True)
 
@@ -1664,8 +1714,15 @@ class MSUIMscolab(QtCore.QObject):
         self.ui.actionChat.setEnabled(False)
         self.ui.actionVersionHistory.setEnabled(False)
         self.ui.actionManageUsers.setEnabled(False)
-        self.ui.menuProperties.setEnabled(False)
+        self.ui.actionViewDescription.setEnabled(False)
+        self.ui.actionLeaveOperation.setEnabled(False)
+        self.ui.actionRenameOperation.setEnabled(False)
+        self.ui.actionArchiveOperation.setEnabled(False)
+        self.ui.actionChangeCategory.setEnabled(False)
+        self.ui.actionChangeDescription.setEnabled(False)
+        self.ui.actionDeleteOperation.setEnabled(False)
         self.ui.workLocallyCheckbox.setEnabled(False)
+        self.ui.menuProperties.setEnabled(False)
         self.ui.serverOptionsCb.hide()
         # change working status label
         self.ui.workingStatusLabel.setText(self.ui.tr("\n\nNo Operation Selected"))
@@ -1721,6 +1778,10 @@ class MSUIMscolab(QtCore.QObject):
             self.logout()
 
     def reload_view_windows(self):
+        logging.debug("reload_view_windows")
+        if self.ui.local_active:
+            return
+
         for window in self.ui.get_active_views():
             window.setFlightTrackModel(self.waypoints_model)
             if hasattr(window, 'mpl'):
@@ -1796,6 +1857,7 @@ class MSUIMscolab(QtCore.QObject):
             self.logout()
 
     def listFlighttrack_itemDoubleClicked(self):
+        logging.debug("listFlighttrack_itemDoubleClicked")
         self.ui.activeOperationDesc.setText("Select Operation to View Description.")
         self.signal_listFlighttrack_doubleClicked.emit()
 
@@ -1820,7 +1882,7 @@ class MSUIMscolab(QtCore.QObject):
         # clear operation listing
         self.ui.listOperationsMSC.clear()
         # clear inactive operation listing
-        self.ui.listInactiveOperationsMSC.clear()
+        self.operation_archive_browser.listArchivedOperations.clear()
         # clear mscolab url
         self.mscolab_server_url = None
         # clear operations list here
@@ -1856,14 +1918,11 @@ class MSUIMscolab(QtCore.QObject):
         # clear user email
         self.email = None
 
-        # delete mscolab http_auth settings for the url
-        if self.mscolab_server_url in self.settings["auth"].keys():
-            del self.settings["auth"][self.mscolab_server_url]
-        save_settings_qsettings('mscolab', self.settings)
-
         # disable category change selector
         self.ui.filterCategoryCb.setEnabled(False)
         self.signal_logout_mscolab.emit()
+
+        self.operation_archive_browser.hide()
 
         # Don't try to activate local flighttrack while testing
         if "pytest" not in sys.modules:
@@ -1874,7 +1933,7 @@ class MSUIMscolab(QtCore.QObject):
 
 class MscolabMergeWaypointsDialog(QtWidgets.QDialog, merge_wp_ui.Ui_MergeWaypointsDialog):
     def __init__(self, local_waypoints_model, server_waypoints_model, fetch=False, parent=None):
-        super(MscolabMergeWaypointsDialog, self).__init__(parent)
+        super().__init__(parent)
         self.setupUi(self)
 
         self.local_waypoints_model = local_waypoints_model
@@ -1947,6 +2006,6 @@ class MscolabMergeWaypointsDialog(QtWidgets.QDialog, merge_wp_ui.Ui_MergeWaypoin
 class MscolabHelpDialog(QtWidgets.QDialog, msc_help_dialog.Ui_mscolabHelpDialog):
 
     def __init__(self, parent=None):
-        super(MscolabHelpDialog, self).__init__(parent)
+        super().__init__(parent)
         self.setupUi(self)
         self.okayBtn.clicked.connect(lambda: self.close())

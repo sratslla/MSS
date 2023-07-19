@@ -44,10 +44,11 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 import owslib.util
 from owslib.crs import axisorder_yx
 from PIL import Image, ImageOps
+from keyring.errors import NoKeyringError, PasswordSetError, InitError
 
 from mslib.msui import constants, wms_capabilities
-from mslib.utils.qt import ui_wms_dockwidget as ui
-from mslib.utils.qt import ui_wms_password_dialog as ui_pw
+from mslib.msui.qt5 import ui_wms_dockwidget as ui
+from mslib.msui.qt5 import ui_wms_password_dialog as ui_pw
 from mslib.utils.qt import Worker
 from mslib.msui.multilayers import Multilayers, Layer
 import mslib.utils.ogcwms as ogcwms
@@ -237,7 +238,7 @@ class MSS_WMS_AuthenticationDialog(QtWidgets.QDialog, ui_pw.Ui_WMSAuthentication
         Arguments:
         parent -- Qt widget that is parent to this widget.
         """
-        super(MSS_WMS_AuthenticationDialog, self).__init__(parent)
+        super().__init__(parent)
         self.setupUi(self)
 
     def getAuthInfo(self):
@@ -265,7 +266,7 @@ class WMSMapFetcher(QtCore.QObject):
     started_request = QtCore.pyqtSignal()
 
     def __init__(self, wms_cache, parent=None):
-        super(WMSMapFetcher, self).__init__(parent)
+        super().__init__(parent)
         self.wms_cache = wms_cache
         self.maps = []
         self.map_imgs = []
@@ -410,7 +411,7 @@ class WMSControlWidget(QtWidgets.QWidget, ui.Ui_WMSDockWidget):
         default_WMS -- list of strings that specify WMS URLs that will be
                        displayed in the URL combobox as default values.
         """
-        super(WMSControlWidget, self).__init__(parent)
+        super().__init__(parent)
         self.setupUi(self)
 
         self.view = view
@@ -618,7 +619,11 @@ class WMSControlWidget(QtWidgets.QWidget, ui.Ui_WMSDockWidget):
                     dlg.lePassword.setText(auth_password)
                     if dlg.exec_() == QtWidgets.QDialog.Accepted:
                         auth_username, auth_password = dlg.getAuthInfo()
-                        save_password_to_keyring(service_name=base_url, username=auth_username, password=auth_password)
+                        try:
+                            save_password_to_keyring(service_name=base_url,
+                                                     username=auth_username, password=auth_password)
+                        except (NoKeyringError, PasswordSetError, InitError) as ex:
+                            logging.warning("Can't use Keyring on your system: %s" % ex)
                         http_auth[base_url] = auth_username
                         data_to_save_in_config_file = {
                             "MSS_auth": http_auth
@@ -1503,7 +1508,7 @@ class VSecWMSControlWidget(WMSControlWidget):
 
     def __init__(self, parent=None, default_WMS=None, waypoints_model=None,
                  view=None, wms_cache=None):
-        super(VSecWMSControlWidget, self).__init__(
+        super().__init__(
             parent=parent, default_WMS=default_WMS, wms_cache=wms_cache, view=view)
         self.waypoints_model = waypoints_model
         self.btGetMap.clicked.connect(self.get_all_maps)
@@ -1585,7 +1590,7 @@ class HSecWMSControlWidget(WMSControlWidget):
     """
 
     def __init__(self, parent=None, default_WMS=None, view=None, wms_cache=None):
-        super(HSecWMSControlWidget, self).__init__(
+        super().__init__(
             parent=parent, default_WMS=default_WMS, wms_cache=wms_cache, view=view)
         self.btGetMap.clicked.connect(self.get_all_maps)
 
@@ -1647,7 +1652,7 @@ class LSecWMSControlWidget(WMSControlWidget):
 
     def __init__(self, parent=None, default_WMS=None, waypoints_model=None,
                  view=None, wms_cache=None):
-        super(LSecWMSControlWidget, self).__init__(
+        super().__init__(
             parent=parent, default_WMS=default_WMS, wms_cache=wms_cache, view=view)
         self.waypoints_model = waypoints_model
         self.btGetMap.clicked.connect(self.get_all_maps)

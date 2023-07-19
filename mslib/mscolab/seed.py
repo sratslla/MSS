@@ -27,6 +27,8 @@
 import logging
 import fs
 import git
+import datetime
+import dateutil.relativedelta
 from sqlalchemy.exc import IntegrityError
 
 from mslib.mscolab.conf import mscolab_settings
@@ -114,9 +116,6 @@ def add_user(email, username, password):
     app.config['SQLALCHEMY_DATABASE_URI'] = mscolab_settings.SQLALCHEMY_DB_URI
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-    template = f"""
-    "MSCOLAB_mailid": "{email}",
-"""
     with app.app_context():
         user_email_exists = User.query.filter_by(emailid=str(email)).first()
         user_name_exists = User.query.filter_by(username=str(username)).first()
@@ -126,7 +125,6 @@ def add_user(email, username, password):
             db.session.commit()
             db.session.close()
             logging.info("Userdata: %s %s %s", email, username, password)
-            logging.info(template)
             return True
         else:
             logging.info("%s already in db", user_name_exists)
@@ -201,6 +199,27 @@ def add_user_to_operation(path=None, access_level='admin', emailid=None):
                     logging.debug("Error writing to db: %s", err)
                 db.session.close()
     return False
+
+
+def archive_operation(path=None, emailid=None):
+    """ this archives an existing operation """
+    if None in (path, emailid):
+        return False
+    app.config['SQLALCHEMY_DATABASE_URI'] = mscolab_settings.SQLALCHEMY_DB_URI
+    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    with app.app_context():
+        operation = Operation.query.filter_by(path=path).first()
+        if operation:
+            user = User.query.filter_by(emailid=emailid).first()
+            if user:
+                perm = Permission.query.filter_by(u_id=user.id, op_id=operation.id).first()
+                if perm is None:
+                    return False
+                elif perm.access_level != "creator":
+                    return False
+                operation.active = False
+                operation.last_used = datetime.datetime.utcnow() - dateutil.relativedelta.relativedelta(months=2)
+                db.session.commit()
 
 
 def seed_data():

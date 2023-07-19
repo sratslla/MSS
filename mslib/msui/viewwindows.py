@@ -46,7 +46,7 @@ class MSUIViewWindow(QtWidgets.QMainWindow):
     # viewClosesId = QtCore.Signal(int, name="viewClosesId")
 
     def __init__(self, parent=None, model=None, _id=None):
-        super(MSUIViewWindow, self).__init__(parent)
+        super().__init__(parent)
 
         # Object variables:
         self.waypoints_model = model  # pointer to the current flight track.
@@ -197,6 +197,12 @@ class MSUIViewWindow(QtWidgets.QMainWindow):
                 action_text = action.text()
                 if action_text in ("Ins WP", "Del WP", "Mv WP"):
                     action.setEnabled(False)
+                    if str(self.mpl.navbar.mode) == "insert waypoint" and action_text == "Ins WP":
+                        action.trigger()
+                    elif str(self.mpl.navbar.mode) == "delete waypoint" and action_text == "Del WP":
+                        action.trigger()
+                    elif str(self.mpl.navbar.mode) == "move waypoint" and action_text == "Mv WP":
+                        action.trigger()
         else:
             # Table View
             self.btAddWayPointToFlightTrack.setEnabled(False)
@@ -213,7 +219,7 @@ class MSUIMplViewWindow(MSUIViewWindow):
     """
 
     def __init__(self, parent=None, model=None, _id=None):
-        super(MSUIMplViewWindow, self).__init__(parent, model, _id)
+        super().__init__(parent, model, _id)
         logging.debug(_id)
         self.mpl = None
 
